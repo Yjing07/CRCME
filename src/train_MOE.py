@@ -1,11 +1,14 @@
 # from lifelines.utils import concordance_index
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "6"
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.abspath(os.path.join(current_dir, ".."))
+sys.path.append(root_dir)
 from random import shuffle
 import torch
 import random
 import logging
-import utils as utils
 import numpy as np
 import time,datetime
 import json
@@ -15,23 +18,18 @@ from collections import OrderedDict
 from sklearn.metrics import classification_report, confusion_matrix
 import torch.nn.functional as F
 import argparse
-from utils import read_json
+from utils.util import read_json,get_rank
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import math
-from loss.loss import cox_loss_torch,nll_loss,CoxLoss,NegativeLogLikelihood,ClipLoss,FocalLoss
-from metrics import concordance_index_torch
-from model.vit_fusion_image import FusionModel, ViT_fu, ViT_ct,FusionPipeline
+from lifelines.utils import concordance_index
+from utils.loss import cox_loss_torch,nll_loss,CoxLoss,NegativeLogLikelihood,ClipLoss,FocalLoss
+from utils.metrics import concordance_index_torch
+from lib.model_MOE import FusionModel, ViT_fu, ViT_ct,FusionPipeline
 import matplotlib.pyplot as plt
-# import sns
-from dataset.ct_dataset import MAE_class
+from utils.dataset import MAE_class,KAD_Survival, BalancedBatchSampler
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.metrics import classification_report, accuracy_score, roc_curve, auc, roc_auc_score, precision_recall_fscore_support,confusion_matrix
-# from model.clip_tqn import TQN_Model
-# from model.CTEncoder_kad import CT_fusion
-# from model.WsiEncoder_kad import Wsi_fusion
-# from torch_geometric.loader import DataLoader
-# from model.ct_wsi_fusion import Fusion_Model
 
 def bucketize(a: torch.Tensor, ids: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     mapping = {k.item(): v.item() for k, v in zip(a, ids)}
@@ -117,7 +115,6 @@ def optimal_thresh(fpr, tpr, thresholds, p=0):
     idx = np.argmin(loss, axis=0)
     return fpr[idx], tpr[idx], thresholds[idx]
 def weighted_voting(model1_preds, model2_preds, weights=(0.5, 0.5)):
-    # 计算加权投票，返回类别标签
     weighted_preds = []
     for pred1, pred2 in zip(model1_preds, model2_preds):
         weighted_score = [0, 0, 0, 0]  # 假设有3个类别
@@ -178,6 +175,26 @@ def five_scores(labels, predictions, num_classes, all_patient_ids,flag):
         class_auc_list = []
     c_m = confusion_matrix(labels,  this_class_label)
     return c_m, auc_value, class_auc_list, acc, precision, recall, fscore
+def evaluate_c_index(model_a, model_b, fusion_model, data_loader, device, args):
+    model_a.eval()
+    model_b.eval()
+    fusion_model.eval()
+    pred_all = []
+    event_all = []
+    delay_all = []
+    ids_all =[]
+    for step, data in enumerate(data_loader):
+        images, event, delay, ids = data
+        images = torch.unsqueeze(images,1).to(torch.float32).cuda()
+        pred = fusion_model(images)
+        pred_all.extend(-pred)
+        event_all.extend(event.cuda())
+        delay_all.extend(delay.cuda())
+        ids_all.extend(ids)
+
+    c_index = concordance_index(torch.tensor(delay_all),torch.tensor(pred_all),torch.tensor(event_all))
+    c_index_torch = concordance_index_torch(torch.tensor(pred_all),torch.tensor(delay_all),torch.tensor(event_all))
+    return c_index,c_index_torch, pred_all, event_all, delay_all,ids_all
 
 @torch.no_grad()
 def evaluate(model_a, model_b, fusion_model, data_loader, args,flag=0):
@@ -219,10 +236,8 @@ def evaluate(model_a, model_b, fusion_model, data_loader, args,flag=0):
     # return auc_value, accuracy
     return c_m, auc_value, class_auc_list, accuracy, precision, recall, fscore, label_all, pred_all, all_patient_id
 
-def train_one_epoch(model_a, model_b, fusion_model, optimizer, data_loader, loss_fn, epoch, writer,args):
-    
-    # model_a.eval()
-    # model_b.eval()
+def train_class(model_a, model_b, fusion_model, optimizer, data_loader, loss_fn, epoch, writer,args):
+
     fusion_model.train()
     for step, data in enumerate(data_loader):
         images, label,_ = data
@@ -244,11 +259,50 @@ def train_one_epoch(model_a, model_b, fusion_model, optimizer, data_loader, loss
             print("[epoch {},step {}/ {}] loss {} ".format(epoch,step, len(data_loader), round(loss.detach().cpu().item(), 4)))
             logging.info("[epoch {},step {}/ {}] loss {} ".format(epoch,step, len(data_loader), round(loss.detach().cpu().item(), 4)))
 
-    return 
+    return
+
+def train_survival(model_a, model_b, fusion_model, optimizer, data_loader,loss_fn, epoch,writer,args):
+    fusion_model.train()
+    optimizer.zero_grad()
+    pred_all = []
+    event_all = []
+    delay_all = []
+    all_ids = []
+    for step, data in enumerate(data_loader):
+        images, event, delay, ids = data
+        images = torch.unsqueeze(images,1).to(torch.float32).cuda()
+        pred = fusion_model(images)
+        pred_all.extend(pred)
+        event_all.extend(event.cuda())
+        delay_all.extend(delay.cuda())
+        all_ids.extend(ids)
+
+        if args.loss == 'cox':
+            loss_survival = cox_loss_torch(pred.squeeze(-1), delay.cuda(), event.cuda())
+        elif args.loss == 'nll_loss':
+            loss = nll_loss(pred, event.reshape(-1,1).to(device),delay.reshape(-1,1).to(device))
+        elif args.loss == 'cox_loss':
+            loss_survival = CoxLoss(delay.reshape(-1,1).to(device), event.reshape(-1,1).to(device),pred.squeeze(-1),device)
+        elif args.loss == 'NegativeLogLikelihood_loss':
+            NegativeLogLikelihood_loss = NegativeLogLikelihood(device)
+            loss_survival = NegativeLogLikelihood_loss(pred, delay.reshape(-1,1).to(device), event.reshape(-1,1).to(device))+cox_loss_torch(pred.squeeze(-1), delay.to(device), event.to(device)) +CoxLoss(delay.reshape(-1,1).to(device), event.reshape(-1,1).to(device),pred.squeeze(-1),device)
+
+        loss = loss_survival
+        loss.backward()
+        optimizer.step()
+
+        writer.add_scalar('Loss/train', loss.item(), epoch * len(data_loader) + step)
+        writer.add_scalar('Loss/loss_survival', loss_survival.item(), epoch * len(data_loader) + step)
+
+        if step%20==0:
+            print("[epoch {},step {}/{}] loss {}, loss_survival {} ".format(epoch,step,len(data_loader), round(loss.detach().cpu().item(), 4), round(loss_survival.detach().cpu().item(), 4)))
+            logging.info("[epoch {},step {}/{}] loss {}, loss_survival {} ".format(epoch,step,len(data_loader), round(loss.detach().cpu().item(), 4), round(loss_survival.detach().cpu().item(), 4)))
+
+    return
 
 def main(args):
-    # device = torch.device(args.device)
-    seed = args.seed + utils.get_rank()
+    device = args.device
+    seed = args.seed + get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -264,7 +318,7 @@ def main(args):
     depth = 24,
     heads = 16,
     emb_dropout = 0.1,
-    norm_layer=partial(torch.nn.LayerNorm, eps=1e-6)) ### 196
+    norm_layer=partial(torch.nn.LayerNorm, eps=1e-6)) 
  
     ct_weights_path = args.pretrained
     model_a_dict = model_a.state_dict()
@@ -273,8 +327,8 @@ def main(args):
         weights_dict = torch.load(ct_weights_path, map_location='cpu')
         pretrained_dict = weights_dict['model']
         new_state_dict = OrderedDict()
-        for k, v in pretrained_dict.items(): # k为module.xxx.weight, v为权重
-            name = k[7:] # 截取`module.`后面的xxx.weight
+        for k, v in pretrained_dict.items(): 
+            name = k[7:] 
             new_state_dict[name] = v
         for k, v in new_state_dict.items():
             if k in model_a_dict:
@@ -296,14 +350,11 @@ def main(args):
                 param.requires_grad = True
             elif 'pool' in name or 'head' in name:
                 param.requires_grad = True
-        # 打印没有被冻结的参数名称
         for name, param in model_a.named_parameters():
             if param.requires_grad:
                 print(name)
 
     model_a = model_a.cuda()
-    # for param in model_a.parameters():
-    #     param.requires_grad = False
 
     model_b = ViT_fu(
     image_size = 256,          # image size
@@ -313,7 +364,7 @@ def main(args):
     dim = 1024,
     depth = 24,
     heads = 16,
-    norm_layer=partial(torch.nn.LayerNorm, eps=1e-6)) ### 196
+    norm_layer=partial(torch.nn.LayerNorm, eps=1e-6)) 
  
     fusion_weights_path = args.pretrained_fu
     model_b_dict = model_b.state_dict()
@@ -322,8 +373,8 @@ def main(args):
         weights_dict = torch.load(fusion_weights_path, map_location='cpu')
         pretrained_dict = weights_dict['model']
         new_state_dict = OrderedDict()
-        for k, v in pretrained_dict.items(): # k为module.xxx.weight, v为权重
-            name = k[7:] # 截取`module.`后面的xxx.weight
+        for k, v in pretrained_dict.items(): 
+            name = k[7:]
             new_state_dict[name] = v
         for k, v in new_state_dict.items():
             if k in model_b_dict:
@@ -337,69 +388,74 @@ def main(args):
         for name, param in model_b.named_parameters():
             if 'blocks' not in name and 'mlp_head' in name:
                 param.requires_grad = True
-            # elif 'adapter' in name:
-            #     param.requires_grad = True
             elif 'prompt' in name:
                 param.requires_grad = True
             elif 'c_attn' in name:
                 param.requires_grad = True
             elif 'pool' in name or 'head' in name:
                 param.requires_grad = True
-        # 打印没有被冻结的参数名称
+
         for name, param in model_b.named_parameters():
             if param.requires_grad:
                 print(name)
     model_b = model_b.cuda()
-    # for param in model_b.parameters():
-    #     param.requires_grad = False
 
     fusion_model = FusionModel(input_dim_a=1024, input_dim_b=1024, classes=args.num_classes)
     pipeline = FusionPipeline(model_a, model_b, fusion_model,args.num_classes)
-    # 打印没有被冻结的参数名称
+
     for name, param in pipeline.named_parameters():
         if param.requires_grad:
             print(name)
     pipeline = pipeline.cuda()
-    # 数据划分，并建立训练集，测试集
+  
     args.Fold = 'Fold_' + str(args.Fold)
     img_idx_list = read_json(args.img_idx)
     label = read_json(args.label_path)
     train_ind = img_idx_list[args.Fold]['train']
     val_ind = img_idx_list[args.Fold]['val']
+    if args.task == 'dfs' or args.task == 'os':
+        trainset = KAD_Survival(train_ind,  args.data_path, label, args.shape, args.task)
+        valset = KAD_Survival(val_ind,  args.data_path, label, args.shape, args.task)
+        train_batch_sampler = BalancedBatchSampler(trainset.labels, n_classes=args.num_classes+1, n_samplers=args.batch_size//(args.num_classes+1))
+        train_loader = torch.utils.data.DataLoader(trainset,
+                                                batch_sampler=train_batch_sampler,
+                                                shuffle=False)
 
-    trainset = MAE_class(train_ind, label,args.data_path, args.shape, args.task)
-    valset = MAE_class(val_ind, label,args.data_path, args.shape, args.task)
+        val_loader = torch.utils.data.DataLoader(valset,
+                                                batch_size=batch_size,
+                                                pin_memory=True,
+                                                num_workers=opt.num_workers,
+                                                shuffle=False,
+                                                drop_last=False
+                                                )
+    else:
+        trainset = MAE_class(train_ind, label,args.data_path, args.shape, args.task)
+        valset = MAE_class(val_ind, label,args.data_path, args.shape, args.task)
 
-    train_loader = torch.utils.data.DataLoader(trainset,
-                                            batch_size=batch_size,
-                                            pin_memory=True,
-                                            num_workers=opt.num_workers,
-                                            shuffle=True,
-                                            drop_last=True)
+        train_loader = torch.utils.data.DataLoader(trainset,
+                                                batch_size=batch_size,
+                                                pin_memory=True,
+                                                num_workers=opt.num_workers,
+                                                shuffle=True,
+                                                drop_last=True)
 
-    val_loader = torch.utils.data.DataLoader(valset,
-                                             batch_size=batch_size,
-                                             pin_memory=True,
-                                             num_workers=opt.num_workers,
-                                             shuffle=True,
-                                             drop_last=True
-                                             )
+        val_loader = torch.utils.data.DataLoader(valset,
+                                                batch_size=batch_size,
+                                                pin_memory=True,
+                                                num_workers=opt.num_workers,
+                                                shuffle=True,
+                                                drop_last=True
+                                                )
     
     print("Creating model")
-    # params = list(model_a.parameters()) + list(model_b.parameters()) + list(fusion_model.parameters())
-    # params = list(model_a.parameters()) + list(model_b.parameters()) + list(fusion_model.parameters()) + list(pipeline.parameters())
-    optimizer = optim.AdamW(pipeline.parameters(), lr=args.lr, weight_decay=1e-4) #, momentum=0.9
-    # Scheduler https://arxiv.org/pdf/1812.01187.pdf
-    lf = lambda x: ((1 + math.cos(x * math.pi / (args.epochs))) / 2) * (1 - args.lrf) + args.lrf  # cosine
+    optimizer = optim.AdamW(pipeline.parameters(), lr=args.lr, weight_decay=1e-4) 
+    lf = lambda x: ((1 + math.cos(x * math.pi / (args.epochs))) / 2) * (1 - args.lrf) + args.lrf  
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
-    # if args.warmup_epochs > 0:
-    #     scheduler = lr_scheduler.LinearLR(optimizer, start_factor=1e-7, total_iters=args.warmup_epochs)
     loss_fn = torch.nn.CrossEntropyLoss().cuda()
-    # loss_fn = FocalLoss(alpha=get_weight(args, train_ind)).cuda()
-    # loss_fn = torch.nn.CrossEntropyLoss().cuda()
     val_best = 0
     for epoch in range(args.epochs):
-        train_one_epoch(model_a,
+        if args.task == 'dfs' or args.task == 'os':
+            train_survival(model_a,
                         model_b,
                         pipeline,
                         optimizer=optimizer,
@@ -408,47 +464,63 @@ def main(args):
                         epoch=epoch,
                         writer=summary_writer,
                         args=args)
-        
-        scheduler.step()
-        # val_auc, val_accuracy = evaluate(model_a,model_b,pipeline, data_loader=val_loader, args=args)
-        train_c_m, train_auc, train_auc_list, train_accuracy, train_precision, train_recall, train_fscore, labels_train, pres_train, ids_train = evaluate(model_a,model_b,pipeline, data_loader=train_loader, args=args)
-        val_c_m, val_auc, val_auc_list, val_accuracy, val_precision, val_recall, val_fscore, labels_val, pres_val, ids_val = evaluate(model_a,model_b,pipeline, data_loader=val_loader, args=args,flag=1)
-        if val_auc > val_best:
-            _all = {}
-            all_labels = labels_train + labels_val
-            all_preds = pres_train + pres_val
-            all_ids = ids_train + ids_val
-            assert len(all_labels) == len(all_preds) == len(all_ids)
-            _all['ids'] = all_ids
-            _all['preds'] = [list(map(float, list(part))) for part in all_preds]
-            _all['labels'] = [int(part) for part in all_labels]
-            json.dump(_all, open(args.log_dir + f'/{args.Fold}_pred.json','w'))
-            val_best = val_auc
-            torch.save(pipeline.state_dict(), os.path.join(args.model_dir, f'the best auc model.pth'))
-            logging.info('***********************************')
+            
+            scheduler.step()
+            c_index,c_index_torch, eval_pred_all, eval_event_all, eval_delay_all, val_ids = evaluate_c_index(model_a,
+                                                                        model_b, pipeline,
+                                                                        data_loader=val_loader,
+                                                                        device=device, args=args)
+            val_acc = float(c_index)
+            if val_acc > val_best:
+                val_best = val_acc
+                torch.save(pipeline.state_dict(), os.path.join(args.model_dir, f'the best model.pth'))
+                logging.info('***********************************')
 
-        print("[epoch {}] train auc: {}, train auc list: {}, train_acc: {}, train_precision: {}, train_recall: {}, train_fscore: {}".format(epoch, train_auc, train_auc_list, train_accuracy, train_precision, train_recall, train_fscore))
-        print("[epoch {}] train confusion matrix:{}".format(epoch, train_c_m))
-        logging.info("[epoch {}] train auc: {}, train auc list: {}, train_acc: {}, train_precision: {}, train_recall: {}, train_fscore: {}".format(epoch, train_auc, train_auc_list, train_accuracy, train_precision, train_recall, train_fscore))
-        logging.info("[epoch {}] train confusion matrix:{}".format(epoch, train_c_m))
-        print("[epoch {}] val auc: {}, val auc list: {}, val_acc: {}, val_precision: {}, val_recall: {}, val_fscore: {}".format(epoch, val_auc, val_auc_list, val_accuracy, val_precision, val_recall, val_fscore))
-        print("[epoch {}] val confusion matrix:{}".format(epoch, val_c_m))
-        logging.info("[epoch {}] val auc: {}, val auc list: {}, val_acc: {}, val_precision: {}, val_recall: {}, val_fscore: {}".format(epoch, val_auc, val_auc_list, val_accuracy, val_precision, val_recall, val_fscore))
-        logging.info("[epoch {}] val confusion matrix:{}".format(epoch, val_c_m))
-        summary_writer.add_scalar('train auc', train_auc, epoch)
-        summary_writer.add_scalar('train acc', train_accuracy, epoch)
-        summary_writer.add_scalar('train prec', train_precision, epoch)
-        summary_writer.add_scalar('train rec', train_recall, epoch)
-        summary_writer.add_scalar('train f1', train_fscore, epoch)
+            print("[epoch {}] val c_torch: {},val c: {}".format(epoch, round(float(c_index_torch), 4), round(float(c_index), 4)))
+            logging.info("[epoch {}] val c_torch: {},val c: {}".format(epoch, round(float(c_index_torch), 4), round(float(c_index), 4)))
+            summary_writer.add_scalar('val c', c_index, epoch)
+            print('The best c_torch: {}'.format(val_best))
+            logging.info('The best c_torch: {}'.format(val_best))
+        else:
+            train_class(model_a,
+                            model_b,
+                            pipeline,
+                            optimizer=optimizer,
+                            data_loader=train_loader,
+                            loss_fn =loss_fn,
+                            epoch=epoch,
+                            writer=summary_writer,
+                            args=args)
+            scheduler.step()
+            train_c_m, train_auc, train_auc_list, train_accuracy, train_precision, train_recall, train_fscore, labels_train, pres_train, ids_train = evaluate(model_a,model_b,pipeline, data_loader=train_loader, args=args)
+            val_c_m, val_auc, val_auc_list, val_accuracy, val_precision, val_recall, val_fscore, labels_val, pres_val, ids_val = evaluate(model_a,model_b,pipeline, data_loader=val_loader, args=args,flag=1)
+            if val_auc > val_best:
+                val_best = val_auc
+                torch.save(pipeline.state_dict(), os.path.join(args.model_dir, f'the best auc model.pth'))
+                logging.info('***********************************')
+            print("[epoch {}] train auc: {}, train auc list: {}, train_acc: {}, train_precision: {}, train_recall: {}, train_fscore: {}".format(epoch, train_auc, train_auc_list, train_accuracy, train_precision, train_recall, train_fscore))
+            print("[epoch {}] train confusion matrix:{}".format(epoch, train_c_m))
+            logging.info("[epoch {}] train auc: {}, train auc list: {}, train_acc: {}, train_precision: {}, train_recall: {}, train_fscore: {}".format(epoch, train_auc, train_auc_list, train_accuracy, train_precision, train_recall, train_fscore))
+            logging.info("[epoch {}] train confusion matrix:{}".format(epoch, train_c_m))
+            print("[epoch {}] val auc: {}, val auc list: {}, val_acc: {}, val_precision: {}, val_recall: {}, val_fscore: {}".format(epoch, val_auc, val_auc_list, val_accuracy, val_precision, val_recall, val_fscore))
+            print("[epoch {}] val confusion matrix:{}".format(epoch, val_c_m))
+            logging.info("[epoch {}] val auc: {}, val auc list: {}, val_acc: {}, val_precision: {}, val_recall: {}, val_fscore: {}".format(epoch, val_auc, val_auc_list, val_accuracy, val_precision, val_recall, val_fscore))
+            logging.info("[epoch {}] val confusion matrix:{}".format(epoch, val_c_m))
+            summary_writer.add_scalar('train auc', train_auc, epoch)
+            summary_writer.add_scalar('train acc', train_accuracy, epoch)
+            summary_writer.add_scalar('train prec', train_precision, epoch)
+            summary_writer.add_scalar('train rec', train_recall, epoch)
+            summary_writer.add_scalar('train f1', train_fscore, epoch)
 
-        summary_writer.add_scalar('val auc', val_auc, epoch)
-        summary_writer.add_scalar('val acc', val_accuracy, epoch)
-        summary_writer.add_scalar('val prec', val_precision, epoch)
-        summary_writer.add_scalar('val rec', val_recall, epoch)
-        summary_writer.add_scalar('val f1', val_fscore, epoch)
+            summary_writer.add_scalar('val auc', val_auc, epoch)
+            summary_writer.add_scalar('val acc', val_accuracy, epoch)
+            summary_writer.add_scalar('val prec', val_precision, epoch)
+            summary_writer.add_scalar('val rec', val_recall, epoch)
+            summary_writer.add_scalar('val f1', val_fscore, epoch)
 
-    print('The best val auc: {}'.format(val_best))
-    logging.info('The best val auc: {}'.format(val_best))
+            print('The best val auc: {}'.format(val_best))
+            logging.info('The best val auc: {}'.format(val_best))
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -456,9 +528,9 @@ if __name__ == '__main__':
                         default='mae',
                         help='model name:[resnet18_fe,resnet34,resnet50_fe,resnet101,resnext50,resnext50_fe,resnext152_fe,resnet18_fe,resnet34_fe]')
     parser.add_argument('--vit', default=True, type=bool)
-    parser.add_argument('--pretrained', default='/cache/yangjing/main_files/CRCFound2/argo2/mymodel/checkpoint-999.pth', type=str)
-    parser.add_argument('--pretrained_fu', default='/cache/yangjing/main_files/CRCFound2/CRCFound2_98/test/patch40_1_3/mix_1880/patch16_frame16_large_256-None/logs/checkpoint-70.pth', type=str)
-    parser.add_argument('--num_classes', type=int, default=4)
+    parser.add_argument('--pretrained', default='', type=str)
+    parser.add_argument('--pretrained_fu', default='', type=str)
+    parser.add_argument('--num_classes', type=int, default=1)
     parser.add_argument('--evaluate', action='store_true')
     parser.add_argument('--scale', type=list, default=[1])
     parser.add_argument('--epochs', type=int, default=200)
@@ -469,21 +541,20 @@ if __name__ == '__main__':
     parser.add_argument('--shape', type=tuple, default=(32,256,256))
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--lrf', type=float, default=0.01)
+    parser.add_argument('--loss', type=str, default="cox",help="[cox,nll_loss,cox_loss,NegativeLogLikelihood_loss]")
     parser.add_argument('--alpha', type=float, default=0.4)
     parser.add_argument('--mask_ratio', default=0., type=float, help='mask ratio of pretrain')
-    parser.add_argument('--Fold', type=int, default=4)
-    # parser.add_argument('--data_path', type=str, default="/cache/yangjing/CRCFound2/datas/all_CT/data/crop_256_32")
-    parser.add_argument('--data_path', type=str, default="/cache/yangjing/main_files/CRCFound2/argo2/liuyuan_CT/crop_256_32/image")
-    parser.add_argument('--label_path', type=str, default="/cache/yangjing/main_files/CRCFound2/datas/all_CT/class_data_split/new_split0321/label_1011.json")
-    parser.add_argument('--img_idx', type=str, default="/cache/yangjing/main_files/CRCFound2/datas/all_CT/class_data_split/new_split0321/cms_320.json")
-    parser.add_argument('--task', type=str, default="cms")
-    # parser.add_argument('--img_idx', type=str, default="/cache/yangjing/CRCFound2/argo2/NB_five_fold_n_361.json")
+    parser.add_argument('--Fold', type=int, default=0)
+    parser.add_argument('--data_path', type=str, default="")
+    parser.add_argument('--label_path', type=str, default="")
+    parser.add_argument('--img_idx', type=str, default="")
+    parser.add_argument('--task', type=str, default="dfs")
     parser.add_argument('--log_path', type=str,
-                        default='/cache/yangjing/main_files/CRCFound2/CRCFound2_98/pretrain_13308/logs/downtask/debug',
+                        default='./logs',
                         help='path to log')
     parser.add_argument('--freeze-layers', type=bool, default=False)
     parser.add_argument('--ver', type=str,
-                        default='/Fold4',
+                        default='/Fold0',
                         help='version of training')
     parser.add_argument('--device', default='cuda:4', help='device id (i.e. 0 or 0,1 or cpu)')
 

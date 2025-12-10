@@ -342,41 +342,43 @@ class MAE_fusion_class(Dataset):
         
         return img, text, label, tumormin_id 
         
-# class MAE_fusion_class(Dataset):
-#     """自定义数据集"""
+class KAD_Survival(Dataset):
+    """自定义数据集"""
 
-#     def __init__(self, img_ind, ct_data_path, lab_dict, size):
-#         super(MAE_fusion_class,self).__init__()
+    def __init__(self, img_ind, ct_data_path, lab_dict, size, task_name):
+        super(KAD_Survival,self).__init__()
 
-#         self.img_list = img_ind
-#         self.images_idx = list(self.img_list.keys())
-#         self.ct_path = ct_data_path
-#         self.all_label = lab_dict
-#         self.size = size
-
-#     def __len__(self):
-#         return len(self.images_idx)
+        self.images_idx = img_ind
+        self.ct_path = ct_data_path
+        self.patient_slide = {}
+        self.all_label = lab_dict
+        self.size = size
+        self.labels = np.array([self.all_label[i][f'{task_name}.event'] for i in self.images_idx])
+        self.task_name = task_name
+    def __len__(self):
+        return len(self.images_idx)
     
-#     def __getitem__(self, i):
-#         # patient_id = self.images_idx[i]
-#         # tumormin_id = self.all_label[patient_id]['tuominID']
-#         tumormin_id = self.images_idx[i]
-#         img_root = os.path.join(self.ct_path,'image', tumormin_id)
-#         roi_root = os.path.join(self.ct_path,'roi', tumormin_id)
-#         img = sitk.ReadImage(img_root)
-#         roi = sitk.ReadImage(roi_root)
+    def __getitem__(self, i):
+        # patient_id = self.images_idx[i]
+        # tumormin_id = self.all_label[patient_id]['tuominID']
+        tumormin_id = self.images_idx[i]
+        img_root = os.path.join(self.ct_path, tumormin_id)
+        # roi_root = os.path.join(self.ct_path,'roi', tumormin_id)
+        img = sitk.ReadImage(img_root)
+        # roi = sitk.ReadImage(roi_root)
 
-#         img = sitk.GetArrayFromImage(img).astype(np.float32)
-#         roi = sitk.GetArrayFromImage(roi).astype(np.float32)
-#         img,roi = randomcrop(img,roi,self.size)
-#         img = torch.from_numpy(img)
-#         roi = torch.from_numpy(roi)
-
-#         text = self.all_label[tumormin_id]['image_findings'][:510]
-
-#         label = self.img_list[tumormin_id]
+        img = sitk.GetArrayFromImage(img).astype(np.float32)
+        # roi = sitk.GetArrayFromImage(roi).astype(np.float32)
+        # img,roi = randomcrop(img,roi,self.size)
+        img = torch.from_numpy(img)
+        # roi = torch.from_numpy(roi)
         
-#         return img,roi, text, label, tumormin_id #,os.path.basename(self.images_ind[i])
+        event =  torch.tensor(self.all_label[tumormin_id][f'{self.task_name}.event'])
+        delay =  torch.tensor(self.all_label[tumormin_id][f'{self.task_name}.delay'])
+
+        # ct_caption = "一张位于{}的{}ct图像。".format(self.all_label[patient_id]['tumor_location'], self.all_label[patient_id]['histopathology'])
+ 
+        return img, event, delay, tumormin_id  #,os.path.basename(self.images_ind[i])
 
 class BalancedBatchSampler(BatchSampler):
     def __init__(self, labels, n_classes, n_samplers):
