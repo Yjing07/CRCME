@@ -70,21 +70,21 @@ def get_args_parser():
                         help='epochs to warmup LR')
 
     # Dataset parameters
-    parser.add_argument('--patches_path', default='/data/home/yangjing/argo_data/Dataset/patches_dim40/', type=str,
+    parser.add_argument('--patches_path', default='', type=str,
                         help='dataset path')
-    parser.add_argument('--ct_path', default='/data/home/yangjing/argo_data/Dataset/crop_256_32/', type=str,
+    parser.add_argument('--ct_path', default='', type=str,
                         help='dataset path')
-    parser.add_argument('--patches_labels', type=str, default="/cache/yangjing/main_files/CRCFound2/CRCME/all_patches.json")
-    parser.add_argument('--ct_path_labels', type=str, default="/cache/yangjing/main_files/CRCFound2/CRCFound2_98/pretrain_13308/pretrain_13172.json")
+    parser.add_argument('--patches_labels', type=str, default="")
+    parser.add_argument('--ct_path_labels', type=str, default="")
 
-    parser.add_argument('--log_path', default='./logs_1w',
+    parser.add_argument('--log_path', default='./logs',
                         help='path where to tensorboard log')
     parser.add_argument('--device', default='cuda:4',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--wsi_pretrain_model', default='/cache/yangjing/main_files/CRCFound2/CRCFound2_98/test/patch40_1_3/wsi/patch16_frame16_large_256-None/logs/checkpoint-150.pth',
+    parser.add_argument('--wsi_pretrain_model', default='',
                         help='resume from checkpoint')
-    parser.add_argument('--ct_pretrain_model', default='/cache/yangjing/main_files/CRCFound2/CRCFound1/logs_1w/patch32_frame16_256_2-None/logs/checkpoint-1000.pth',
+    parser.add_argument('--ct_pretrain_model', default='',
                         help='resume from checkpoint')
     parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
