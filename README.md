@@ -16,22 +16,22 @@ This repository provides:
 
 First clone the repo and cd into the directory:
 
-    ```
-    git clone https://github.com/Yjing07/CRCME.git
-    cd CRCME
-    ```
+```
+git clone https://github.com/Yjing07/CRCME.git
+cd CRCME
+```
 
 Using requirements.txt
 
-    • Install the required Python packages using pip: `pip install -r requirements.txt`
+• Install the required Python packages using pip: `pip install -r requirements.txt`
 
 Using environment.yml
 
-    • Install the required Python packages using pip: `conda env create -f environment.yml`
+• Install the required Python packages using pip: `conda env create -f environment.yml`
 
 Activate the Conda environment
 
-    • Then create a conda env and install the dependencies: `conda activate my_python_env`
+• Then create a conda env and install the dependencies: `conda activate my_python_env`
 
 
 
