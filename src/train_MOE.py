@@ -327,8 +327,8 @@ def main(args):
         weights_dict = torch.load(ct_weights_path, map_location='cpu')
         pretrained_dict = weights_dict['model']
         new_state_dict = OrderedDict()
-        for k, v in pretrained_dict.items(): 
-            name = k[7:] 
+        for k, v in pretrained_dict.items():
+            name = k[7:]
             new_state_dict[name] = v
         for k, v in new_state_dict.items():
             if k in model_a_dict:
