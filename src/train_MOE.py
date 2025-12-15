@@ -187,7 +187,7 @@ def evaluate_c_index(model_a, model_b, fusion_model, data_loader, device, args):
         images, event, delay, ids = data
         images = torch.unsqueeze(images,1).to(torch.float32).cuda()
         pred = fusion_model(images)
-        pred_all.extend(-pred)
+        pred_all.extend(pred)
         event_all.extend(event.cuda())
         delay_all.extend(delay.cuda())
         ids_all.extend(ids)
@@ -242,10 +242,7 @@ def train_class(model_a, model_b, fusion_model, optimizer, data_loader, loss_fn,
     for step, data in enumerate(data_loader):
         images, label,_ = data
         images = torch.unsqueeze(images,1).to(torch.float32).cuda()
-        # rois = torch.unsqueeze(rois,1).to(torch.float32).cuda()
         label = label.cuda()
-        # output_a = model_a(images)
-        # output_b = model_b(images)
         pred = fusion_model(images)
         loss = loss_fn(pred, label)
         optimizer.zero_grad()
@@ -263,7 +260,7 @@ def train_class(model_a, model_b, fusion_model, optimizer, data_loader, loss_fn,
 
 def train_survival(model_a, model_b, fusion_model, optimizer, data_loader,loss_fn, epoch,writer,args):
     fusion_model.train()
-    optimizer.zero_grad()
+    
     pred_all = []
     event_all = []
     delay_all = []
@@ -280,7 +277,7 @@ def train_survival(model_a, model_b, fusion_model, optimizer, data_loader,loss_f
         if args.loss == 'cox':
             loss_survival = cox_loss_torch(pred.squeeze(-1), delay.cuda(), event.cuda())
         elif args.loss == 'nll_loss':
-            loss = nll_loss(pred, event.reshape(-1,1).to(device),delay.reshape(-1,1).to(device))
+            loss_survival = nll_loss(pred, event.reshape(-1,1).to(device),delay.reshape(-1,1).to(device))
         elif args.loss == 'cox_loss':
             loss_survival = CoxLoss(delay.reshape(-1,1).to(device), event.reshape(-1,1).to(device),pred.squeeze(-1),device)
         elif args.loss == 'NegativeLogLikelihood_loss':
@@ -288,6 +285,7 @@ def train_survival(model_a, model_b, fusion_model, optimizer, data_loader,loss_f
             loss_survival = NegativeLogLikelihood_loss(pred, delay.reshape(-1,1).to(device), event.reshape(-1,1).to(device))+cox_loss_torch(pred.squeeze(-1), delay.to(device), event.to(device)) +CoxLoss(delay.reshape(-1,1).to(device), event.reshape(-1,1).to(device),pred.squeeze(-1),device)
 
         loss = loss_survival
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
@@ -301,7 +299,7 @@ def train_survival(model_a, model_b, fusion_model, optimizer, data_loader,loss_f
     return
 
 def main(args):
-    device = args.device
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     seed = args.seed + get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -354,7 +352,7 @@ def main(args):
             if param.requires_grad:
                 print(name)
 
-    model_a = model_a.cuda()
+    model_a.to(device)
 
     model_b = ViT_fu(
     image_size = 256,          # image size
@@ -398,7 +396,7 @@ def main(args):
         for name, param in model_b.named_parameters():
             if param.requires_grad:
                 print(name)
-    model_b = model_b.cuda()
+    model_b.to(device)
 
     fusion_model = FusionModel(input_dim_a=1024, input_dim_b=1024, classes=args.num_classes)
     pipeline = FusionPipeline(model_a, model_b, fusion_model,args.num_classes)
@@ -406,7 +404,7 @@ def main(args):
     for name, param in pipeline.named_parameters():
         if param.requires_grad:
             print(name)
-    pipeline = pipeline.cuda()
+    pipeline.to(device)
   
     args.Fold = 'Fold_' + str(args.Fold)
     img_idx_list = read_json(args.img_idx)
@@ -451,7 +449,7 @@ def main(args):
     optimizer = optim.AdamW(pipeline.parameters(), lr=args.lr, weight_decay=1e-4) 
     lf = lambda x: ((1 + math.cos(x * math.pi / (args.epochs))) / 2) * (1 - args.lrf) + args.lrf  
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
-    loss_fn = torch.nn.CrossEntropyLoss().cuda()
+    loss_fn = torch.nn.CrossEntropyLoss().to(device)
     val_best = 0
     for epoch in range(args.epochs):
         if args.task == 'dfs' or args.task == 'os':
@@ -528,8 +526,8 @@ if __name__ == '__main__':
                         default='mae',
                         help='model name:[resnet18_fe,resnet34,resnet50_fe,resnet101,resnext50,resnext50_fe,resnext152_fe,resnet18_fe,resnet34_fe]')
     parser.add_argument('--vit', default=True, type=bool)
-    parser.add_argument('--pretrained', default='', type=str)
-    parser.add_argument('--pretrained_fu', default='', type=str)
+    parser.add_argument('--pretrained_ct', default='', type=str)
+    parser.add_argument('--pretrained_joint', default='', type=str)
     parser.add_argument('--num_classes', type=int, default=1)
     parser.add_argument('--evaluate', action='store_true')
     parser.add_argument('--scale', type=list, default=[1])

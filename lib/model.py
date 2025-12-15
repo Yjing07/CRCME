@@ -459,7 +459,7 @@ class ViT(nn.Module):
     def forward(self, input, mask_ratio=0.75,feature=False,tag=0):
         latent, mask, ids_restore,noise = self.forward_encoder(input, mask_ratio,tag)
         if feature:
-            return latent, noise
+            return latent
         else:
             pred = self.forward_decoder(latent, ids_restore, tag)  # [N, L, p*p*3]
             loss = self.forward_loss(input, pred, mask, tag)
