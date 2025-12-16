@@ -416,123 +416,10 @@ class ViT_fu(nn.Module):
 
         # return self.mlp_head(x)
 
-# class FusionModel(nn.Module):
-#     def __init__(self, input_dim_a, input_dim_b, classes):
-#         super(FusionModel, self).__init__()
-#         # self.fc1 = nn.Linear(input_dim_a + input_dim_b, 512)
-#         # self.attn = nn.MultiheadAttention(embed_dim=512, num_heads=8)
-#         # 
-#         self.fc1 = nn.Linear(input_dim_a, classes)
-#         self.fc2 = nn.Linear(input_dim_b, classes)
-
-#     def forward(self, x_a, x_b):
-#         x1 = self.fc1(x_a)
-#         x2 = self.fc2(x_b)
-#         # fused_features = torch.cat((x_a, x_b), dim=1)  # 拼接
-#         # x = torch.relu(self.fc1(fused_features))  # 初步映射
-#         # x = x.unsqueeze(0)  # 为了适配MultiheadAttention输入，增加batch维度
-#         # attn_output, _ = self.attn(x, x, x)  # 自注意力机制
-#         # x = attn_output.squeeze(0)  # 恢复batch维度
-#         # x = self.fc2(x)  # 分类输出
-
-#         return x1, x2
-
-# class FusionModel(nn.Module):
-#     def __init__(self, input_dim_a, input_dim_b, classes):
-#         super(FusionModel, self).__init__()
-
-#         # 用于加权融合的参数：权重参数会在训练过程中自动调整
-#         self.attention_a = nn.Parameter(torch.tensor(0.5))  # a 模态的加权系数
-#         self.attention_b = nn.Parameter(torch.tensor(0.5))  # b 模态的加权系数
-
-#         # 用于对每种特征进行MLP处理的层
-#         self.mlp_a = nn.Sequential(
-#             nn.Linear(input_dim_a, 512),
-#             nn.ReLU(),
-#             nn.Linear(512, 256),
-#             nn.ReLU()
-#         )
-        
-#         self.mlp_b = nn.Sequential(
-#             nn.Linear(input_dim_b, 512),
-#             nn.ReLU(),
-#             nn.Linear(512, 256),
-#             nn.ReLU()
-#         )
-
-#         # 分类输出层
-#         self.fc1 = nn.Linear(256 + 2 * input_dim_a, 256)
-#         self.fc2 = nn.Linear(256, classes)
-
-#     def forward(self, a, b):
-#         # a 和 b 是 [batch_size, seq_len, feature_dim] 的张量
-#         cls_token_features1, all_tokens_features1 = a[:, 0], a[:, 1:]
-#         cls_token_features2, all_tokens_features2 = b[:, 0], b[:, 1:]
-
-#         # 通过平均池化获取各自模态的全局特征
-#         pooled_a = torch.mean(all_tokens_features1, dim=1)  # [batch_size, feature_dim]
-#         pooled_b = torch.mean(all_tokens_features2, dim=1)  # [batch_size, feature_dim]
-
-#         # 使用 MLP 对池化后的特征进行处理
-#         fused_a = self.mlp_a(pooled_a)
-#         fused_b = self.mlp_b(pooled_b)
-
-#         # 动态加权融合特征
-#         weighted_fused_a = fused_a * self.attention_a
-#         weighted_fused_b = fused_b * self.attention_b
-
-#         # 将加权后的特征进行拼接
-#         fused_features = weighted_fused_a + weighted_fused_b
-#         fused_features = torch.cat([fused_features, cls_token_features1, cls_token_features2], dim=1)
-
-#         # 分类
-#         x = torch.relu(self.fc1(fused_features))
-#         output = self.fc2(x)
-#         return output
-
-
-
-# class FusionModel(nn.Module):
-#     def __init__(self, input_dim_a, input_dim_b, classes):
-#         super(FusionModel, self).__init__()
-#         self.fc1 = nn.Linear(input_dim_a, 512)  # 输入为1024维特征，输出为512维
-#         self.fc2 = nn.Linear(512, classes)  # 分类输出层
-
-#         # 权重参数，用于加权平均
-#         self.attention_a = nn.Parameter(torch.tensor([0.1]))  # a 特征的权重
-#         self.attention_b = nn.Parameter(torch.tensor([0.9]))  # b 特征的权重
-    
-#     def forward(self, a, b):
-#         # 对 a 和 b 特征进行加权
-#         cls_token_features1, all_tokens_features1 = a[:, 0], a[:, 1:]
-#         cls_token_features2, all_tokens_features2 = b[:, 0], b[:, 1:]
-
-#         # 通过平均池化获取各自模态的全局特征
-#         pooled_a = torch.mean(all_tokens_features1, dim=1)  # [batch_size, feature_dim]
-#         pooled_b = torch.mean(all_tokens_features2, dim=1)  # [batch_size, feature_dim]
-        
-#         attention_a = torch.sigmoid(self.attention_a)  # 使用sigmoid确保权重在(0, 1)之间
-#         attention_b = torch.sigmoid(self.attention_b)
-
-#         weighted_a = attention_a * pooled_a
-#         weighted_b = attention_b * pooled_b
-
-#         # 融合加权后的特征
-#         fused_features = weighted_a + weighted_b
-        
-#         # 通过全连接层进行处理
-#         x = torch.relu(self.fc1(fused_features))
-#         output = self.fc2(x)
-#         return output
-
 class FusionModel(nn.Module):
     def __init__(self, input_dim_a, input_dim_b, classes):
         super(FusionModel, self).__init__()
         self.fc1 = nn.Linear(input_dim_a + input_dim_b, 512)
-        # self.bn1 = nn.BatchNorm1d(512)
-        # self.fc2 = nn.Linear(512, 256)
-        # self.bn2 = nn.BatchNorm1d(256)
-        # self.fc3 = nn.Linear(256, classes)
         self.weight_generator = nn.Sequential(
             nn.Linear(input_dim_a + input_dim_b, input_dim_a,),
             nn.ReLU(),
@@ -542,19 +429,9 @@ class FusionModel(nn.Module):
     def forward(self, a, b):
         cls_token_features1, all_tokens_features1 = a[:, 0], a[:, 1:]
         cls_token_features2, all_tokens_features2 = b[:, 0], b[:, 1:]
-        # fused_features = torch.cat((cls_token_features1, cls_token_features2), dim=1)
-        # weights = self.weight_generator(fused_features)  # [B, 2]
-        # weights = F.softmax(weights, dim=1)           # Normalize weights
         fused_pooled = 0.5 * cls_token_features1 + 0.5 * cls_token_features2
-        # 融合特征
-        # feat = weights[:, 0].view(-1, 1, 1, 1) * cls_token_features1 + weights[:, 1].view(-1, 1, 1, 1) * cls_token_features2
-        # fused_pooled = feat.mean(dim=2)
-        # fused_pooled =  a
         return fused_pooled
-        # x = torch.relu(self.bn1(self.fc1(fused_features)))
-        # x = torch.relu(self.bn2(self.fc2(x)))
-        # x = self.fc3(x)
-        # return x
+
 class WeightNet(nn.Module):
     def __init__(self, feat_dim1, feat_dim2, hidden_dim=32):
         super().__init__()
@@ -583,9 +460,7 @@ class FusionPipeline(nn.Module):
         feat_b = self.model_b(x)
         w = self.weight_net(feat_a[:, 0], feat_b[:, 0])
         fused_feat = w[:,0:1]*feat_a[:, 0] + w[:,1:2]*feat_b[:, 0]
-        # fused_feat = self.fusion(feat_a, feat_b)
         logits = self.classifier(fused_feat)   # 分类输出 [B, num_classes]
-        # return logits, fused_feat.cpu().numpy()
         if flag:
             return logits, fused_feat.cpu().numpy(), w
         else:
