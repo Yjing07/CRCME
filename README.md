@@ -35,21 +35,32 @@ Activate the Conda environment
 
 ## 2. Preparing and loading the model
 
-Download the [pre-trained weight](https://drive.google.com/file/d/1zT6FsCh7RubL_k0LMGQwjhRMV90sprch/view?usp=sharing) first!
-
-First create the ```checkpoints directory``` inside the root of the repo:
-
+### Step 1: Create the checkpoints directory
 ```
 mkdir -r checkpoints
+```
+### Step 2: Download pre-trained weights
+Download the following pre-trained weights and place them into the checkpoints/ directory:
+
+• [**CT pre-trained weights**](https://drive.google.com/file/d/1zT6FsCh7RubL_k0LMGQwjhRMV90sprch/view?usp=sharing)
+
+• [**Joint pre-trained weights**](https://drive.google.com/file/d/1zT6FsCh7RubL_k0LMGQwjhRMV90sprch/view?usp=sharing)
+
+Directory structure:
+
+```
+checkpoints/
+├── ct_pretrained.pth
+└── joint_pretrained.pth
 ```
 
 ## 3. Data preparation
 
-Before inputting the model, CT images need to be preprocessed. We set all image Spaceing to ```(1.0, 1.0, 3.0)```, and all image sizes to```(32, 256, 256)```. For histopathology images, we extract patches from whole-slide images (WSIs) and resize them to `(256, 256)` pixels. These patches are normalized and used to guide CT feature learning in the pathology-enhanced representation module.
+Before feeding data into the model, CT images need to be preprocessed. Specifically, all CT images are **resampled** to a spacing of ```(1.0, 1.0, 3.0)``` and **resized** to ```(32, 256, 256)``` voxels.
 
-> During pretraining, the image dataset is saved as a JSON file.
+For histopathology images, we extract patches from whole-slide images (WSIs) and resize them to ```(256, 256)``` pixels. These patches are **normalized** and used to guide CT feature learning within the pathology-enhanced representation module.
 
-> For downstream tasks, the organization of labels is as follows:
+> During pretraining, the image dataset is saved as a JSON file. For downstream tasks, the organization of labels is as follows:
   ```
   {
     "image_name1":
@@ -58,7 +69,7 @@ Before inputting the model, CT images need to be preprocessed. We set all image 
     ...
   }
   ```
-  The data splits for five-fold cross-validation are saved as:
+  > The data splits for five-fold cross-validation are saved as:
   ```
    {
     "Fold_0":
@@ -73,67 +84,93 @@ Before inputting the model, CT images need to be preprocessed. We set all image 
   ```
 
 ## 4. Fine-tuning in your datasets
-Download the pre-trained weight from [Google Drive](https://drive.google.com/file/d/1zT6FsCh7RubL_k0LMGQwjhRMV90sprch/view?usp=sharing) and specify _weight directory_ during training.
 
 ### Fine-tuning using CT images on one task
 
-After data preprocessing, prepare the label file according to the above structure and set the label path to start training.
+After preprocessing your data, prepare the label file following the structure described above, and set the appropriate label path to start training.
 
 ```
-python ./src/train_MOE.py --model_name mae --pretrained_ct checkpoints/checkpoint-ct.pth --pretrained_joint checkpoints/checkpoint-joint.pth  --epochs 200 --batch_size 8 --lr 0.0001 --shape (32,256,256) -- data_path ${IMAGE_DIR}$ --label_path $LABELS DIR$ --log_path ./logs
+python ./src/train_MOE.py \
+    --model_name mae \
+    --pretrained_ct checkpoints/checkpoint-ct.pth \
+    --pretrained_joint checkpoints/checkpoint-joint.pth \
+    --epochs 200 \
+    --batch_size 8 \
+    --lr 0.0001 \
+    --shape (32,256,256) \
+    --data_path ${IMAGE_DIR} \
+    --label_path ${LABELS_DIR} \
+    --log_path ./logs
 ```
+**Notes:**
+
+• Replace ```${IMAGE_DIR}``` and ```${LABELS_DIR}``` with the paths to your CT images and label files.
+
+• Adjust ```--epochs```, ```--batch_size```, and ```--lr``` according to your dataset size and GPU memory.
+
+• Logs and checkpoints will be saved under ```./logs``` by default.
+
 
 ## Basic Usage: CRCME as a Vision Encoder
- ### 1. Load the CRCME
-   ```
-   import torch
-   import os
-   from lib.model import ViT
 
-   model = ViT("CRCFound_large_patch16_256")
-   pretrained_path = 'checkpoints/checkpoint-ct.pth'  # TODO
-   if os.path.isfile(pretrained_path):
-     print(f"Loading pretrained weights from: {pretrained_path}")
-     checkpoint = torch.load(pretrained_path, map_location='cpu')
-     pretrained_weights = checkpoint.get('model', checkpoint) 
-     cleaned_weights = {k.replace("module.", ""): v for k, v in pretrained_weights.items()}
-     compatible_weights = {k: v for k, v in cleaned_weights.items() if k in model.state_dict()}
-     model.load_state_dict(
-          {**model.state_dict(), **compatible_weights}
-      )
-     print("Pretrained weights loaded successfully.")
-   else:
-     raise FileNotFoundError(f"Pretrained model not found at: {pretrained_path}")
-  model.to(device="cuda", dtype=torch.float16)
-  model.eval()
-   ```
-### 2. Encode images with CRCME
-   ```
-   import torch
-   import SimpleITK as sitk
-   import numpy as np
+We provide a Jupyter Notebook demo that demonstrates how to extract features from CT images using CRCME. You can run it interactively to see step-by-step how the model is loaded and used.
 
-   img_root = '' # TODO
-   img = sitk.ReadImage(img_root)
-   img = torch.from_numpy(sitk.GetArrayFromImage(img).astype(np.float32))
-   img_tensor = img.unsqueeze(0).unsqueeze(0)
-   with torch.inference_mode():
-     image_embeddings = model(
-          image=img_tensor.to("cuda"),
-          feature=True    # return global feature token
-      )[0]  # shape: [1, feature_dim]
-   ```
+**1. Open the Demo Notebook**
+
+• File: [scr/CRCME_feature_extraction_demo.ipynb](src/demo.ipynb)
+
+• This notebook includes:
+  
+    (1) Loading the pre-trained CT and joint/FU weights
+    (2) Encoding a single CT image
+    (3) Batch encoding multiple images
+    (4) Optionally saving features for downstream tasks
+
+**2. Quick Example (from the notebook)**
+```
+import torch
+from lib.model_MOE import ViT_ct, ViT_fu, FusionModel, FusionPipeline
+
+# Initialize models
+model_a = ViT_ct("CRCFound_large_patch16_256")
+model_b = ViT_fu("CRCFound_large_patch16_256")
+fusion_model = FusionModel(input_dim_a=1024, input_dim_b=1024, classes=2)
+pipeline = FusionPipeline(model_a, model_b, fusion_model, num_classes=2)
+
+# Load pretrained weights
+pipeline.load_pretrained(ct_path="checkpoints/checkpoint-ct.pth",
+                         fu_path="checkpoints/checkpoint-joint.pth")
+
+pipeline.to("cuda").eval()
+
+# Encode a CT image
+img_tensor = ... # preprocessed CT image tensor, shape [1,1,D,H,W]
+with torch.inference_mode():
+    features = pipeline(img_tensor.to("cuda"), return_features=True)
+
+print("Feature shape:", features.shape)
+```
 
 ## Optional Usage: CRCME as a Clinical Expert
 
-After data preprocessing and fine-tuning, CRCME can be applied as a clinical expert model to predict multiple clinical endpoints from CT images.
+After preprocessing the data and fine-tuning the model, CRCME can be used as a **clinical expert** to predict multiple clinical endpoints from CT images.
 
 ```
-python ./src/train_MOE.py --model_name mae --pretrained_ct checkpoints/checkpoint-ct.pth --pretrained_joint checkpoints/checkpoint-joint.pth  --epochs 200 --batch_size 8 --lr 0.0001 --shape (32,256,256) -- data_path ${IMAGE_DIR}$ --label_path $LABELS DIR$ --log_path ./logs
+python ./src/eval_report_generation.py \
+    --model_name mae \
+    --pretrained_root ./checkpoints/downrasks \
+    --img_root ${IMAGE_DIR} \
+    --lr 0.0001 \
+    --shape (32,256,256) \
+    --Patient_ID $Patient_ID \
+    --Patient_name $Patient_name \
+    --Patient_age $Patient_age \
+    --Patient_sex $Patient_sex \
+    --log_path ./logs/report
+
 ```
 
 ## References
-
 This project builds upon and is inspired by the following works:
 
 - [PyTorch](https://pytorch.org/) – the primary deep learning framework used for model development.
