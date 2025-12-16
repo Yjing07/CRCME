@@ -42,9 +42,9 @@ mkdir -r checkpoints
 ### Step 2: Download pre-trained weights
 Download the following pre-trained weights and place them into the checkpoints/ directory:
 
-• [**CT pre-trained weights**](https://drive.google.com/file/d/1zT6FsCh7RubL_k0LMGQwjhRMV90sprch/view?usp=sharing)
+• [**CT pre-trained weights**](https://drive.google.com/file/d/1hdMLMW8qA4mIGA4FjPsFg4YiwoCAIp9Q/view?usp=drive_link)
 
-• [**Joint pre-trained weights**](https://drive.google.com/file/d/1zT6FsCh7RubL_k0LMGQwjhRMV90sprch/view?usp=sharing)
+• [**Joint pre-trained weights**](https://drive.google.com/file/d/1iaKr8P0Qyi96iyac6otyh2t0lsZB7iq8/view?usp=drive_link)
 
 Directory structure:
 
