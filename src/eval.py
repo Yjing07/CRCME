@@ -385,22 +385,6 @@ def main(args):
         pred_results[task_name] = evaluate(model_a,model_b,pipeline, task_name, data_path=args.img_root, args=args,flag=1)
     print(pred_results)
     ### create_clinical_report
-    datas = {
-        "Patient ID": args.Patient_ID,
-        "Name": args.Patient_name,
-        "Age": args.Patient_age,
-        "Sex": args.Patient_sex,
-        "T stage": pred_results['tnm.t']['true_label'] + " (Probability:" + str(pred_results['tnm.t']['prob']) + ')',
-        "N stage": pred_results['tnm.n']['true_label'] + " (Probability:" + str(pred_results['tnm.n']['prob']) + ')',
-        "M stage": pred_results['tnm.m']['true_label'] + " (Probability:" + str(pred_results['tnm.m']['prob']) + ')',
-        "TNM stage": pred_results['tnm.tnm']['true_label'] + " (Probability:" +str( pred_results['tnm.tnm']['prob']) + ')',
-        "CMS": pred_results['cms']['true_label'] + " (Probability:" + str(pred_results['cms']['prob']) + ')',
-        "MSI": pred_results['msi']['true_label'] + " (Probability:" + str(pred_results['msi']['prob']) + ')',
-        "Disease-Free Survival (DFS)": pred_results['dfs']['true_label'],
-        "Overall survival (OS)": pred_results['os']['true_label']
-    }
-    create_clinical_report(datas=datas, save_path=f"{args.Patient_ID}_{args.Patient_name}_{args.Patient_age}.pdf")
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str,
@@ -424,7 +408,7 @@ if __name__ == '__main__':
     parser.add_argument('--Patient_name', type=str, default="zhangsan")
     parser.add_argument('--Patient_age', type=str, default="60")
     parser.add_argument('--Patient_sex', type=str, default="male")
-    parser.add_argument('--tasks', type=list, default=["tnm.t", "tnm.n", "tnm.m", "tnm.tnm", "msi", "cms", "dfs", "os"])
+    parser.add_argument('--tasks', type=list, default=["tnm.t"])
     parser.add_argument('--log_path', type=str,
                         default='./logs',
                         help='path to log')

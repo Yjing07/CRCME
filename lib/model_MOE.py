@@ -5,7 +5,7 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 import torch.nn.functional as F
 from timm.models.layers import drop_path, to_2tuple, trunc_normal_
-# from lib.pos_embed import get_3d_sincos_pos_embed
+from lib.pos_embed import get_2d_sincos_pos_embed
 import math
 
 def pair(t):
@@ -230,7 +230,7 @@ class ViT_ct(nn.Module):
             decoder_num_heads=16,
             norm_layer=nn.LayerNorm,
             mlp_ratio=4.,
-            qkv_bias=False,
+            qkv_bias=True,
             qk_scale=None, 
             drop_rate=0., 
             attn_drop_rate=0.,
@@ -256,13 +256,13 @@ class ViT_ct(nn.Module):
         self.pos_embedding = nn.Parameter(torch.zeros(1, num_patches + 1, dim))
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
         self.dropout = nn.Dropout(emb_dropout)
-        # self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
-            Block(dim, heads, mlp_ratio, qkv_bias=True, qk_scale=None, norm_layer=norm_layer)
-            for i in range(depth)])
-        self.norm = norm_layer(dim)
-        # self.text_proj = nn.Linear(4096, dim)
+            Block(dim, heads, mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                  drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i],
+                  norm_layer=norm_layer)
+            for i in range(depth)
+        ])
 
         self.pool = pool
         self.to_latent = nn.Identity()
@@ -270,25 +270,36 @@ class ViT_ct(nn.Module):
             nn.Linear(dim, num_classes)
         )
 
-    def initialize_weights(self):
-        # initialization
-        # initialize (and freeze) pos_embed by sin-cos embedding
-        pos_embed = get_3d_sincos_pos_embed(self.pos_embedding.shape[-1], self.num_h, self.num_c, cls_token=True)
-        self.pos_embedding.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+    def _initialize_weights(self):
+        pos_embed = get_2d_sincos_pos_embed(
+            self.pos_embedding.shape[-1], self.num_h, self.num_c, cls_token=True
+        )
+        self.pos_embedding.data.copy_(
+            torch.from_numpy(pos_embed).float().unsqueeze(0)
+        )
 
-        decoder_pos_embed = get_3d_sincos_pos_embed(self.decoder_pos_embed.shape[-1], self.num_h, self.num_c, cls_token=True)
-        self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
+        dec_pos_embed = get_2d_sincos_pos_embed(
+            self.decoder_pos_embed.shape[-1], self.num_h, self.num_c, cls_token=True
+        )
+        self.decoder_pos_embed.data.copy_(
+            torch.from_numpy(dec_pos_embed).float().unsqueeze(0)
+        )
 
-        # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
         w = self.patch_embed.proj.weight.data
-        torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-
-        # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
-        torch.nn.init.normal_(self.cls_token, std=.02)
-        torch.nn.init.normal_(self.mask_token, std=.02)
-
+        torch.nn.init.xavier_uniform_(w.view(w.shape[0], -1))
+        torch.nn.init.normal_(self.cls_token, std=0.02)
+        torch.nn.init.normal_(self.mask_token, std=0.02)
         self.apply(self._init_weights)
-    def _init_weights(self, m):
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
         if isinstance(m, nn.Linear):
             torch.nn.init.xavier_uniform_(m.weight)
             if isinstance(m, nn.Linear) and m.bias is not None:
@@ -311,7 +322,7 @@ class ViT_ct(nn.Module):
         for blocks in self.blocks:
             skip_list.append(x)
             x = blocks(x)
-        x = self.norm(x)
+        # x = self.norm(x)
         return x
     
     def forward(self, input):

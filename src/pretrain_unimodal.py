@@ -47,7 +47,7 @@ def get_args_parser():
     parser.add_argument('--shape', type=tuple, default=(32,256, 256),
                         help='images input size')
 
-    parser.add_argument('--mask_ratio', default=0.9, type=float,
+    parser.add_argument('--mask_ratio', default=0.75, type=float,
                         help='Masking ratio (percentage of removed patches).')
     parser.add_argument('--exp_name', default='patch16_frame16_large_256', type=str, help='exp name')
     parser.add_argument('--norm_pix_loss', action='store_true',

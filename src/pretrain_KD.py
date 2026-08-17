@@ -1,10 +1,8 @@
 import argparse
 import datetime
-import cv2
 from collections import OrderedDict
 from functools import partial
 import json
-import shutil
 import numpy as np
 import sys
 import os
@@ -12,16 +10,11 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.abspath(os.path.join(current_dir, ".."))
 sys.path.append(root_dir)
 import time
-from pathlib import Path
 import logging
-import math
 import torch
 import torch.backends.cudnn as cudnn
-import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-from torchvision.transforms.functional import InterpolationMode
 from utils.dataset import pretrain_dataset
 import timm
 
@@ -30,7 +23,6 @@ import timm.optim.optim_factory as optim_factory
 
 import utils.misc as misc
 from utils.misc import NativeScalerWithGradNormCount as NativeScaler
-from lib.model import ViT
 from utils.util import AverageMeter, ProgressMeter, save_checkpoint, reload_ckpt_bis, reload_ckpt, \
     count_parameters, save_metrics, inference, post_trans, dice_metric, \
     dice_metric_batch, read_json, adjust_learning_rate
@@ -38,19 +30,22 @@ from utils.util import AverageMeter, ProgressMeter, save_checkpoint, reload_ckpt
 from lib.vit_new import ViT
 from lib.vit_teacher import ViT_teacher
 
+
 def get_args_parser():
-    parser = argparse.ArgumentParser('MRM pre-training', add_help=False)
+    parser = argparse.ArgumentParser('CRCME Stage-II pathology-guided pre-training', add_help=False)
     parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU effective batch size is batch_size * accum_iter * # gpus')
     parser.add_argument('--epochs', default=600, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
-    parser.add_argument('--shape', type=tuple, default=(32,256, 256),
+    parser.add_argument('--shape', type=tuple, default=(32, 256, 256),
                         help='images input size')
 
-    parser.add_argument('--mask_ratio', default=0.5, type=float,
-                        help='Masking ratio (percentage of removed patches).')
+    parser.add_argument('--mask_ratio', default=0.75, type=float,
+                        help='Masking ratio (percentage of removed patches). '
+                             'Applied to both the CT reconstruction branch and the pathology '
+                             'distillation branch; teacher and student share the same mask.')
     parser.add_argument('--exp_name', default='patch32_frame32_large_256', type=str, help='exp name')
     parser.add_argument('--norm_pix_loss', action='store_true',
                         help='Use (per-patch) normalized pixels as targets for computing loss')
@@ -79,13 +74,13 @@ def get_args_parser():
 
     parser.add_argument('--log_path', default='./logs',
                         help='path where to tensorboard log')
-    parser.add_argument('--device', default='cuda:4',
+    parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--wsi_pretrain_model', default='',
-                        help='resume from checkpoint')
+                        help='Stage-I pathology checkpoint, loaded into the frozen teacher')
     parser.add_argument('--ct_pretrain_model', default='',
-                        help='resume from checkpoint')
+                        help='Stage-I CT checkpoint, loaded into the Joint Expert (student)')
     parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -95,19 +90,31 @@ def get_args_parser():
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
-    
+
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--local-rank', default=-1, type=int)
-    # parser.add_argument('--distributed', action='store_true')
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
 
     return parser
 
+
 def train_one_epoch(model, teacher_model, data_loader, optimizer, device, epoch, loss_scaler, writer, args):
+    """Stage-II training.
+
+    CT volumes (3D) and WSI patches (2D) cannot be processed in a single forward
+    pass, so the two objectives are optimized in ALTERNATING steps rather than
+    combined into a weighted sum: each batch contains a single modality and is
+    optimized with the objective for that modality.
+
+        CT batch  -> masked image modeling (reconstruction) loss
+        WSI batch -> token-level MSE distillation against the frozen teacher
+
+    Both objectives are applied with equal weight; no balancing coefficient is used.
+    """
     model.train(True)
 
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -121,37 +128,38 @@ def train_one_epoch(model, teacher_model, data_loader, optimizer, device, epoch,
 
     if writer is not None:
         print('log_dir: {}'.format(writer.log_dir))
-    
+
     for data_iter_step, (samples, img_name) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        
+
         if data_iter_step % accum_iter == 0:
             adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
-        # samples = torch.unsqueeze(samples,1).to(torch.float32).cuda()
         with torch.cuda.amp.autocast():
             if img_name[0][-3:] != 'png':
+                # ---- CT batch: masked image modeling ----
                 samples = samples.squeeze(0).to(torch.float32).cuda()
                 loss, _, _ = model(samples, mask_ratio=args.mask_ratio, tag=0)
             else:
-                tag=1
+                # ---- WSI batch: pathology-guided distillation ----
                 samples = samples.squeeze(0).to(torch.float32).cuda()
-                perm = torch.randperm(samples.size()[0])
-                data_shuffled = samples[perm]
-                lambda_value = torch.rand(samples.size()[0], 1, 1, 1).cuda()
-                samples = lambda_value * samples + (1 - lambda_value) * data_shuffled
-                latent_out, noise = model(samples, mask_ratio=args.mask_ratio, feature=True,tag=1)
+                student_out, noise = model(samples, mask_ratio=args.mask_ratio,
+                                           feature=True, tag=1)
                 with torch.no_grad():
-                    target_out = teacher_model(samples, mask_ratio=args.mask_ratio, noise=noise)
-                loss_mse = ((target_out.detach() - latent_out) ** 2).mean()
-                loss = loss_mse
-                
+                    teacher_out = teacher_model(samples, mask_ratio=args.mask_ratio,
+                                                noise=noise)
+
+                # Token-level MSE on the output of the final encoder block,
+                # computed over all tokens of the sequence (the CLS token and the
+                # visible patch tokens) and averaged over the embedding dimension.
+                loss = ((teacher_out.detach() - student_out) ** 2).mean()
+
         loss_value = loss.item()
 
         loss /= accum_iter
 
         loss_scaler(loss, optimizer, parameters=model.parameters(),
                     update_grad=(data_iter_step + 1) % accum_iter == 0)
-        
+
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
 
@@ -172,10 +180,11 @@ def train_one_epoch(model, teacher_model, data_loader, optimizer, device, epoch,
             writer.add_scalar('lr', lr, epoch_1000x)
             if misc.is_main_process():
                 logging.info("[epoch {},step {}] loss {} ".format(epoch, data_iter_step, loss_value_reduce))
- 
+
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
 
 def main(args):
 
@@ -189,8 +198,8 @@ def main(args):
     np.random.seed(seed)
     cudnn.benchmark = True
 
-    exp_name = args.exp_name+'-'+str(args.lr)
-    args.log_dir =  args.log_path + '/' + exp_name + '/logs'
+    exp_name = args.exp_name + '-' + str(args.lr)
+    args.log_dir = args.log_path + '/' + exp_name + '/logs'
     args.model_dir = args.log_path + '/' + exp_name + '/models'
     args.mask_dir = args.log_path + '/' + exp_name + '/masks'
     args.reconstruction_dir = args.log_path + '/' + exp_name + '/reconstructions'
@@ -208,15 +217,16 @@ def main(args):
 
     ct_dict = read_json(args.ct_path_labels)
     patches_dict = read_json(args.patches_labels)
-    lab_dict ={}
-    lab_dict['ct']=ct_dict
-    lab_dict['wsi']=patches_dict
+    lab_dict = {}
+    lab_dict['ct'] = ct_dict
+    lab_dict['wsi'] = patches_dict
     tran_list = [
         transforms.Resize((args.shape[1], args.shape[-1])),
         transforms.ToTensor(),
-            ]
+    ]
     transform_train = transforms.Compose(tran_list)
-    dataset_train = pretrain_dataset(args.ct_path,args.patches_path, lab_dict, args.shape, batch_size=args.batch_size,transform_train=transform_train)
+    dataset_train = pretrain_dataset(args.ct_path, args.patches_path, lab_dict, args.shape,
+                                     batch_size=args.batch_size, transform_train=transform_train)
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
         global_rank = misc.get_rank()
@@ -229,84 +239,95 @@ def main(args):
 
     try:
         data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=1,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True
-         )
+            dataset_train, sampler=sampler_train,
+            batch_size=1,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=True
+        )
     except RuntimeError as e:
         print(f"Caught pin memory error: {e}")
-        
-        
+
+    # ---- Joint Expert (student): ViT-L backbone shared by both modalities ----
     model = ViT(
-    image_size = 256,          # image size
-    frames = 32,               # number of frames
-    image_patch_size = 16,     # image patch size
-    frame_patch_size = 16,      # frame patch size
-    dim = 1024,
-    depth = 24,
-    heads = 16,
-    emb_dropout = 0.1,
-    decoder_embed_dim=512, 
-    decoder_depth=8, 
-    decoder_num_heads=16,
-    mlp_ratio=4.,
-    norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
-    norm_pix_loss=args.norm_pix_loss)
-    
-    
+        image_size=256,            # image size
+        frames=32,                 # number of frames
+        image_patch_size=16,       # image patch size
+        frame_patch_size=16,       # frame patch size
+        dim=1024,
+        depth=24,
+        heads=16,
+        emb_dropout=0.1,
+        decoder_embed_dim=512,
+        decoder_depth=8,
+        decoder_num_heads=16,
+        mlp_ratio=4.,
+        norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+        norm_pix_loss=args.norm_pix_loss)
+
+    # ---- Frozen pathology teacher ----
     teacher_model = ViT_teacher(
-    image_size = 256,          # image size
-    frames = 32,               # number of frames
-    image_patch_size = 16,     # image patch size
-    frame_patch_size = 16,      # frame patch size
-    dim = 1024,
-    depth = 24,
-    heads = 16,
-    emb_dropout = 0.1,
-    decoder_embed_dim=512, 
-    decoder_depth=8, 
-    decoder_num_heads=16,
-    mlp_ratio=4.,
-    norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
-    norm_pix_loss=args.norm_pix_loss)
-    
+        image_size=256,            # image size
+        frames=32,                 # number of frames
+        image_patch_size=16,       # image patch size
+        frame_patch_size=16,       # frame patch size
+        dim=1024,
+        depth=24,
+        heads=16,
+        emb_dropout=0.1,
+        decoder_embed_dim=512,
+        decoder_depth=8,
+        decoder_num_heads=16,
+        mlp_ratio=4.,
+        norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+        norm_pix_loss=args.norm_pix_loss)
+
     print(f"total number of trainable parameters {count_parameters(model)}")
 
-
+    # ---- Load Stage-I CT weights into the student ----
     ct_checkpoint = torch.load(args.ct_pretrain_model, map_location='cpu')
     model_dict = model.state_dict()
-    # print(model_dict)
 
     updata_dict = OrderedDict()
     ct_pretrained_dict = ct_checkpoint['model']
     new_state_dict = OrderedDict()
-    for k, v in ct_pretrained_dict.items(): # k为module.xxx.weight, v为权重
-        name = k[7:] # 截取`module.`后面的xxx.weight
+    for k, v in ct_pretrained_dict.items():
+        name = k[7:]  # strip the leading `module.`
         new_state_dict[name] = v
     for k, v in new_state_dict.items():
-        if k in model_dict and 'patch_embed_2D.proj' not in k:
-            updata_dict[k]=v
+        if k in model_dict and 'patch_embed_2D' not in k:
+            updata_dict[k] = v
     model_dict.update(updata_dict)
     model.load_state_dict(model_dict)
-    print('load pretrained model success')
+    print('load pretrained CT model success')
 
+    # ---- Load Stage-I pathology weights into the teacher ----
     wsi_checkpoint = torch.load(args.wsi_pretrain_model, map_location='cpu')
     wsi_pretrained_dict = wsi_checkpoint['model']
-    model_dict = model.state_dict()
     t_updata_dict = OrderedDict()
     t_model_dict = teacher_model.state_dict()
     new_t_state_dict = OrderedDict()
-    for k, v in wsi_pretrained_dict.items(): # k为module.xxx.weight, v为权重
-        name = k[7:] # 截取`module.`后面的xxx.weight
+    for k, v in wsi_pretrained_dict.items():
+        name = k[7:]  # strip the leading `module.`
         new_t_state_dict[name] = v
     for k, v in new_t_state_dict.items():
         if k in t_model_dict:
-            t_updata_dict[k]=v
+            t_updata_dict[k] = v
     t_model_dict.update(t_updata_dict)
     teacher_model.load_state_dict(t_model_dict)
-    print('load pretrained model success')
+    print('load pretrained pathology model success')
+
+    # The pathology patch embedding head is shared: the same Stage-I weights are
+    # loaded into the student and kept frozen, so both branches tokenize WSI
+    # patches identically.
+    model_dict = model.state_dict()
+    pe_dict = OrderedDict()
+    for k, v in new_t_state_dict.items():
+        if k.startswith('patch_embed_2D') and k in model_dict:
+            pe_dict[k] = v
+    model_dict.update(pe_dict)
+    model.load_state_dict(model_dict)
+    print('load frozen pathology patch embedding into the student success')
 
     model.cuda()
     teacher_model.cuda()
@@ -314,9 +335,9 @@ def main(args):
     model_without_ddp = model
     print("Model = %s" % str(model_without_ddp))
     logging.info(args)
-    
+
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-    
+
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
 
@@ -331,13 +352,18 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
-        teacher_model = torch.nn.parallel.DistributedDataParallel(teacher_model, device_ids=[args.gpu], find_unused_parameters=True)
-        teacher_model_without_ddp = teacher_model.module
+        teacher_model = torch.nn.parallel.DistributedDataParallel(teacher_model, device_ids=[args.gpu],
+                                                                  find_unused_parameters=True)
 
+    # The pathology teacher is frozen throughout Stage II and receives no gradient.
     for p in teacher_model.parameters():
         p.requires_grad = False
     for p in model.parameters():
         p.requires_grad = True
+    # WSI patches are tokenized through a frozen patch embedding head.
+    for p in model_without_ddp.patch_embed_2D.parameters():
+        p.requires_grad = False
+
     # following timm: set wd as 0 for bias and norm layers
     param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
@@ -370,7 +396,7 @@ def main(args):
                 loss_scaler=loss_scaler, epoch=epoch)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        'epoch': epoch,}
+                     'epoch': epoch, }
 
         if args.log_dir and misc.is_main_process():
             if t_writer_1 is not None:
